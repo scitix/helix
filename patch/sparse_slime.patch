@@ -1,0 +1,310 @@
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index 9abb2f96..3d636989 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -36,7 +36,11 @@ from .model import forward_only, initialize_model_and_optimizer, save, train
+ from .update_weight.common import named_params_and_buffers
+ from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
+ from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+-
++try:
++    from sparse_update import save_model_sparse_info, gather_sparse_indices_in_dp_group, get_sparse_args
++    SPARSE_ARGS = get_sparse_args()
++except ImportError:
++    SPARSE_ARGS = None
+ logging.getLogger("megatron").setLevel(logging.WARNING)
+ 
+ logger = logging.getLogger(__name__)
+@@ -145,6 +149,9 @@ class MegatronTrainRayActor(TrainRayActor):
+             self._switch_model("actor")
+             self.sleep()
+ 
++        self.sparse_args = SPARSE_ARGS 
++        self._optimizer_updated = False
++
+         self.rollout_engines = None
+ 
+         self.rollout_data_postprocess = None
+@@ -478,6 +485,8 @@ class MegatronTrainRayActor(TrainRayActor):
+                     num_microbatches,
+                 )
+ 
++            self._optimizer_updated = True
++            
+             self.prof.step(rollout_id=rollout_id)
+ 
+         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+@@ -555,10 +564,28 @@ class MegatronTrainRayActor(TrainRayActor):
+             dist.barrier(group=get_gloo_group())
+             if dist.get_rank() == 0:
+                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
++        
++        sparse_update, sparse_validate, sparse_observe = False, False, False
++        if self.sparse_args is not None:
++            sparse_update = self.sparse_args.sparse_update and self._optimizer_updated
++            sparse_validate = self.sparse_args.sparse_validate and sparse_update
++            sparse_observe = self.sparse_args.sparse_observe
+ 
+         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+-            print_memory("before update_weights")
+-            self.weight_updater.update_weights()
++            print_memory(f"before update_weights. {sparse_update=}, {sparse_validate=}, {sparse_observe=}")
++            if sparse_observe and getattr(self, "optimizer", None) is not None:
++                model_tag = (
++                    type(self.hf_config).__name__.lower()
++                    if self.args.model_name is None
++                    else self.args.model_name
++                )
++                save_model_sparse_info(self.model, model_tag=model_tag, flush_indices_interval=1)
++            if sparse_validate:
++                self.weight_updater.update_weights(use_sparse_update=False, validate_sparse_update=True)
++            if sparse_update:
++                gather_sparse_indices_in_dp_group(self.model)
++
++            self.weight_updater.update_weights(use_sparse_update=sparse_update, validate_sparse_update=sparse_validate)
+             print_memory("after update_weights")
+ 
+             if self.args.ci_test and len(rollout_engines) > 0:
+diff --git a/slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py b/slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py
+index 7b5b7817..f5578fec 100644
+--- a/slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py
++++ b/slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py
+@@ -1,3 +1,4 @@
++import os
+ import socket
+ import time
+ from argparse import Namespace
+@@ -17,6 +18,13 @@ from ..megatron_to_hf import convert_to_hf
+ from .common import all_gather_param, named_params_and_buffers
+ 
+ 
++try:
++    from sparse_update import maybe_sparse_param_to_dense_nan, SparseBucket
++    HAVE_SPARSE_UPDATE = True
++except ImportError:
++    SparseBucket = None
++    HAVE_SPARSE_UPDATE = False
++
+ class UpdateWeightFromDistributed:
+     """
+     Update distributed engines via NCCL. Each PP rank: group "slime-pp_{pp_rank}",
+@@ -41,6 +49,7 @@ class UpdateWeightFromDistributed:
+         self.quantization_config = quantization_config
+         self.weight_version = 0
+         self._model_update_groups = None
++        self._sparse_buckets = SparseBucket() if HAVE_SPARSE_UPDATE else None
+ 
+     def connect_rollout_engines(
+         self,
+@@ -77,13 +86,24 @@ class UpdateWeightFromDistributed:
+                 rollout_engines,
+                 engine_gpu_counts=engine_gpu_counts,
+             )
++    
++    def convert_to_hf(self, *args, **kwargs) -> list[tuple[str, torch.Tensor]]:
++        converted_named_tensors = convert_to_hf(*args, **kwargs)
++        if not self.use_sparse_update:
++            return converted_named_tensors
++        self._sparse_buckets.append(converted_named_tensors)
++        return []
++
+ 
+     @torch.no_grad()
+-    def update_weights(self) -> None:
++    def update_weights(self, use_sparse_update: bool = False, validate_sparse_update: bool = False) -> None:
+         """
+         Pause → flush → non-expert (TP) → expert (EP) → continue. Progress on PP source.
+         """
+         self.weight_version += 1
++        # Temporary variables for testing
++        self.use_sparse_update = HAVE_SPARSE_UPDATE and use_sparse_update
++        self.validate_sparse_update = HAVE_SPARSE_UPDATE and validate_sparse_update
+ 
+         if dist.get_rank() == 0:
+             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+@@ -106,6 +126,8 @@ class UpdateWeightFromDistributed:
+         for name, param in named_params_and_buffers(self.args, self.model):
+             if ".experts." in name:
+                 continue
++            if self.use_sparse_update:
++                param = maybe_sparse_param_to_dense_nan(name, param)
+             buffer_size = self._update_weight_from_distributed(
+                 name, param, converted_named_tensors, buffer_size, pbar=pbar
+             )
+@@ -120,12 +142,17 @@ class UpdateWeightFromDistributed:
+         for name, param in named_params_and_buffers(self.args, self.model):
+             if ".experts." not in name:
+                 continue
++            if self.use_sparse_update:
++                param = maybe_sparse_param_to_dense_nan(name, param)
+             buffer_size = self._update_expert_weight_from_distributed(
+                 name, param, named_tensors, buffer_size, pbar=pbar
+             )
+ 
+         if named_tensors:
+             self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
++        
++        if self.use_sparse_update and self._is_pp_src_rank:
++            self._update_bucket_weights_from_distributed([], pbar=pbar, flush=True)
+ 
+         dist.barrier(group=get_gloo_group())
+         if dist.get_rank() == 0:
+@@ -159,7 +186,7 @@ class UpdateWeightFromDistributed:
+         if buffer_size + param_size > self.args.update_weight_buffer_size:
+             self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+             buffer_size = 0
+-        converted_named_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
++        converted_named_tensors += self.convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+         buffer_size += param_size
+         return buffer_size
+ 
+@@ -221,27 +248,46 @@ class UpdateWeightFromDistributed:
+         all_gathered_params = sum(all_gathered_params, [])
+         converted_hf_tensors = []
+         for name, param in all_gathered_params:
+-            converted_hf_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
++            converted_hf_tensors += self.convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+ 
+         self._update_bucket_weights_from_distributed(converted_hf_tensors, pbar)
+ 
+     def _update_bucket_weights_from_distributed(
+-        self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
++        self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None,
++        flush: bool = False
+     ) -> None:
+         """
+         Lock → broadcast → clear → unlock → pbar++. Lock prevents NCCL deadlock.
+         """
++        if self.use_sparse_update and not flush:
++            assert len(converted_named_tensors) == 0, "converted_named_tensors should be empty"
++            self._sparse_buckets.append(converted_named_tensors, True)
++            return 
++          
+         # lock the rollout engines to prevent dead lock on broadcast.
+         while not ray.get(self.rollout_engine_lock.acquire.remote()):
+             time.sleep(0.1)
+-
+-        refs = update_weights_from_distributed(
+-            self._group_name,
+-            self._model_update_groups,
+-            self.weight_version,
+-            self.rollout_engines,
+-            converted_named_tensors,
+-        )
++        
++        if self.use_sparse_update:
++            sparse_stats : dict = self._sparse_buckets.finalize()
++            print(f"[SparseRL-Sync-stats] {sparse_stats}", flush=True)
++            refs = update_sparse_weights_from_distributed(
++                self._group_name,
++                self._model_update_groups,
++                self.weight_version,
++                self.rollout_engines,
++                self._sparse_buckets,
++                validate_weights=self.validate_sparse_update,
++            )
++        else:
++            refs = update_weights_from_distributed(
++                self._group_name,
++                self._model_update_groups,
++                self.weight_version,
++                self.rollout_engines,
++                converted_named_tensors,
++                validate_weights=self.validate_sparse_update,
++            )
+ 
+         ray.get(refs)
+         converted_named_tensors.clear()
+@@ -313,6 +359,7 @@ def update_weights_from_distributed(
+     weight_version: int,
+     rollout_engines: Sequence[ActorHandle],
+     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
++    validate_weights: bool = False,
+ ) -> list[ObjectRef]:
+     """
+     Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines).
+@@ -328,6 +375,14 @@ def update_weights_from_distributed(
+         for engine in rollout_engines
+     ]
+ 
++    if HAVE_SPARSE_UPDATE:
++        extra_info = {"validate_weights": bool(validate_weights)}
++        torch.distributed.broadcast_object_list(
++            object_list=[extra_info],
++            src=0,
++            group=group,
++        )
++
+     handles = []
+     for _, param in converted_named_tensors:
+         handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
+@@ -354,3 +409,55 @@ def post_process_weights(
+             for engine in rollout_engines
+         ]
+     )
++
++
++def update_sparse_weights_from_distributed(
++    group_name: str,
++    group: dist.ProcessGroup,
++    weight_version: int,
++    rollout_engines: Sequence[ActorHandle],
++    sparse_weight_bucket: SparseBucket,
++    *,
++    validate_weights: bool = False,
++) -> list[ObjectRef]:
++    """Sparse weight broadcast protocol.
++
++    Expects each tensor to use NaN as "unchanged" marker, converts to sparse (indices, values),
++    merges across tensors into two big buffers and broadcasts them once, along with meta.
++    """
++
++    refs = [
++        engine.update_weights_from_distributed.remote(
++            names=sparse_weight_bucket.names,
++            dtypes=sparse_weight_bucket.dtypes,
++            shapes=sparse_weight_bucket.shapes,
++            group_name=group_name,
++            weight_version=str(weight_version),
++        )
++        for engine in rollout_engines
++    ]
++
++    torch.distributed.broadcast_object_list(
++        object_list=[
++            {
++                "nnz_list": sparse_weight_bucket.nnz_list,
++                "merged_numel_list": sparse_weight_bucket.merged_numel_list,
++                "merged_dtype_list": sparse_weight_bucket.merged_dtype_list,
++                "validate_weights": bool(validate_weights),
++            }
++        ],
++        src=0,
++        group=group,
++    )
++
++    handles = []
++
++    for merged_indices, merged_values in zip(sparse_weight_bucket.merged_indices_list, sparse_weight_bucket.merged_values_list):
++        if merged_indices is None or merged_values is None:
++            continue
++        handles.append(dist.broadcast(merged_indices, 0, group=group, async_op=True))
++        handles.append(dist.broadcast(merged_values, 0, group=group, async_op=True))
++    for handle in handles:
++        handle.wait()
++
++    return refs
+\ No newline at end of file
+diff --git a/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+index b53cc5bd..48f074d9 100644
+--- a/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
++++ b/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+@@ -135,7 +135,7 @@ class UpdateWeightFromTensor:
+                 self._ipc_engine = engine
+ 
+     @torch.no_grad()
+-    def update_weights(self) -> None:
++    def update_weights(self, *args, **kwargs) -> None:
+         """
+         version++, flush caches, process buckets. Progress on rank 0.
+         """

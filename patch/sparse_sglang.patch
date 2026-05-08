@@ -1,0 +1,193 @@
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index d984c2e12..586837821 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -175,6 +175,17 @@ from sglang.srt.weight_sync.tensor_bucket import (
+     FlattenedTensorMetadata,
+ )
+ 
++try:
++    from sparse_update import (
++        SparseLoaderValidateState,
++        sparse_copy_context,
++        sparse_to_dense,
++        validate_sparse_weights,
++    )
++    HAVE_SPARSE_UPDATE = True
++except ImportError:
++    HAVE_SPARSE_UPDATE = False
++
+ _is_hip = is_hip()
+ _is_npu = is_npu()
+ _is_cpu_amx_available = cpu_has_amx_support()
+@@ -1246,7 +1257,60 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             message = f"Failed to destroy custom process group: {e}."
+             logger.error(message)
+             return False, message
++    
++    def _update_weights_extra_info(self, group_name):
++        """Recv extra info before update_weights_from_distributed()."""
++        extra_meta_info = [None]
++        torch.distributed.broadcast_object_list(
++            object_list=extra_meta_info,
++            src=0,
++            group=self._model_update_group[group_name],
++        )
++        extra_meta_info = extra_meta_info[0]
++
++        # TODO: Use enum instead of string.
++        nnz_list : list[int] | None = extra_meta_info.get("nnz_list", None)
++        validate_weights : bool = extra_meta_info.get("validate_weights", False)
++        merged_numel_list : list[int] = extra_meta_info.get("merged_numel_list", None)
++        merged_dtype_list : list[torch.dtype] = extra_meta_info.get("merged_dtype_list", None)
++        bucket_size : int = extra_meta_info.get("bucket_size", 2 * 1024**3) # 2GB
++
++        return nnz_list, validate_weights, merged_numel_list, merged_dtype_list, bucket_size
+ 
++    def _recv_merged_sparse_weights(self, group_name:str, merged_numel_list:list[int], merged_dtype_list:list[torch.dtype], indices_dtype:torch.dtype=torch.int32) -> dict[torch.dtype, tuple[torch.Tensor, torch.Tensor]]:
++        """Recv merged sparse weights before update_weights_from_distributed()."""
++        handles = []
++        dtype_to_sparse_tensor : dict[torch.dtype, tuple[torch.Tensor, torch.Tensor]] = {}
++
++        for merged_numel, values_dtype in zip(merged_numel_list, merged_dtype_list):
++            values_dtype = values_dtype if isinstance(values_dtype, torch.dtype) else getattr(torch, values_dtype)
++
++            merged_indices = torch.empty(merged_numel, dtype=indices_dtype, device=self.device)
++            merged_values = torch.empty(merged_numel, dtype=values_dtype, device=self.device)
++
++            handles.append(
++                torch.distributed.broadcast(
++                    merged_indices,
++                    src=0,
++                    group=self._model_update_group[group_name],
++                    async_op=True,
++                )
++            )
++            handles.append(
++                torch.distributed.broadcast(
++                    merged_values,
++                    src=0,
++                    group=self._model_update_group[group_name],
++                    async_op=True,
++                )
++            )
++            dtype_to_sparse_tensor[values_dtype] = (merged_indices, merged_values)
++        
++
++        for handle in handles:
++            handle.wait()
++        return dtype_to_sparse_tensor
++    
+     def update_weights_from_distributed(
+         self,
+         names,
+@@ -1259,6 +1323,109 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         Update specific parameter in the model weights online
+         through `_model_update_group` process group.
+ 
++        Args:
++            name: the name of the parameter to be updated.
++            dtype: the data type of the parameter to be updated.
++            shape: the shape of the parameter to be updated.
++        """
++        if not HAVE_SPARSE_UPDATE:
++            return self.original_update_weights_from_distributed(names, dtypes, shapes, group_name, load_format)
++
++        assert group_name in self._model_update_group, (
++            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
++            "Please call `init_weights_update_group` first."
++        )
++
++        nnz_list, validate_weights, merged_numel_list, merged_dtype_list, bucket_size = self._update_weights_extra_info(group_name)
++        if nnz_list is None:
++            if validate_weights:
++                validate_sparse_weights(
++                    self.model,
++                    SparseLoaderValidateState.BEFORE_FULL_UPDATE,
++                    validate_key=group_name,
++                )
++            return self.original_update_weights_from_distributed(names, dtypes, shapes, group_name, load_format)
++
++        if load_format == "flattened_bucket":
++            raise NotImplementedError("Flattened bucket format is not supported for sparse update now.")
++        
++        if sum(merged_numel_list) == 0:
++            if validate_weights:
++                validate_sparse_weights(
++                    self.model,
++                    SparseLoaderValidateState.ZERO_NNZ_UPDATE,
++                    validate_key=group_name,
++                )
++            return True, "Succeeded to update parameter online."
++
++        try:
++            if validate_weights:
++                validate_sparse_weights(
++                    self.model,
++                    SparseLoaderValidateState.BEFORE_SPARSE_UPDATE,
++                    validate_key=group_name,
++                )
++            dtype_to_sparse_tensor : dict[torch.dtype, tuple[torch.Tensor, torch.Tensor]] = self._recv_merged_sparse_weights(group_name, merged_numel_list, merged_dtype_list)
++            dtype_to_offset : dict[torch.dtype, int] = {}
++            weights : list[tuple[str, torch.Tensor]] = []
++
++            curr_bucket_size = 0
++            for name, shape, dtype, nnz in zip(names, shapes, dtypes, nnz_list):
++                if nnz == 0:
++                    continue
++                dtype_key = dtype if isinstance(dtype, torch.dtype) else getattr(torch, str(dtype))
++
++                offset = dtype_to_offset.get(dtype_key, 0)
++
++                merged_indices, merged_values = dtype_to_sparse_tensor[dtype_key]
++                indices = merged_indices[offset:offset+nnz]
++                values = merged_values[offset:offset+nnz]
++
++                dtype_to_offset[dtype_key] = offset + nnz
++
++                dense_weight = sparse_to_dense(indices, values, shape, self.device)
++                weights.append((name, dense_weight))
++
++                curr_bucket_size += dense_weight.nbytes
++                if curr_bucket_size >= bucket_size:
++                    with sparse_copy_context():
++                        self.model.load_weights(weights)
++                    weights.clear()
++                    curr_bucket_size = 0
++
++            if weights:
++                with sparse_copy_context():
++                    self.model.load_weights(weights)
++
++            if validate_weights:
++                validate_sparse_weights(
++                    self.model,
++                    SparseLoaderValidateState.AFTER_SPARSE_UPDATE,
++                    validate_key=group_name,
++                )
++
++            return True, "Succeeded to update parameter online."
++        except Exception as e:
++            error_msg = (
++                f"Failed to update parameter online: {e}. "
++                f"The full weights of the ModelRunner are partially updated. "
++                f"Please discard the whole weights."
++            )
++            logger.error(error_msg, exc_info=True)
++            return False, error_msg
++
++    def original_update_weights_from_distributed(
++        self,
++        names,
++        dtypes,
++        shapes,
++        group_name,
++        load_format: Optional[str] = None,
++    ):
++        """
++        Update specific parameter in the model weights online
++        through `_model_update_group` process group.
++
+         Args:
+             name: the name of the parameter to be updated.
+             dtype: the data type of the parameter to be updated.

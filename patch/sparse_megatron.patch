@@ -1,0 +1,115 @@
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index 28487c3b3..9b70a33eb 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -5,6 +5,13 @@ from typing import Dict
+ import torch
+ 
+ 
++try:
++    from sparse_update import sparse_diff_context
++except ImportError:
++    from contextlib import nullcontext
++    def sparse_diff_context(*args, **kwargs):
++        return nullcontext()
++
+ def _param_generator(cpu_optimizer):
+     for group in cpu_optimizer.param_groups:
+         for param in group["params"]:
+@@ -121,7 +128,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+                 with torch.cuda.stream(self._h2d_stream):
+                     for param in _param_generator(optimizer):
+                         gpu_param = self.cpu_copys_map_gpu_param[param]
+-                        gpu_param.data.copy_(param.data, non_blocking=True)
++                        with sparse_diff_context(gpu_param, param):
++                            gpu_param.data.copy_(param.data, non_blocking=True)
+                 self._d2h_stream.record_event().wait(torch.cuda.current_stream())
+ 
+             return param_copy_back_gpu_hook
+@@ -137,7 +145,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+ 
+                         if param in self.param_to_fp32_param:
+                             fp32_param = self.param_to_fp32_param[param]
+-                            param.data.copy_(fp32_param.data)
++                            with sparse_diff_context(param, fp32_param):
++                                param.data.copy_(fp32_param.data)
+ 
+             return fp32_param_copy_back_gpu_hook
+ 
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index eac21a3ea..6c703ec33 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -53,6 +53,15 @@ from .grad_scaler import MegatronGradScaler
+ from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
+ from .optimizer_config import OptimizerConfig
+ 
++
++try:
++    from sparse_update import sparse_diff_context, init_sparse_manager
++except ImportError:
++    from contextlib import nullcontext
++    def sparse_diff_context(*args, **kwargs):
++        return nullcontext()
++    init_sparse_manager = lambda *args, **kwargs: None
++
+ logger = getLogger(__name__)
+ 
+ 
+@@ -412,6 +421,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                     model_float16_params_this_group.append(model_param)
+                     shard_float16_params_this_group.append(shard_model_param)
+                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
++                    init_sparse_manager(model_param=model_param, shard_model_weight=shard_model_param, shard_main_weight=shard_main_param, param_range=param_range)
+ 
+                 # fp32 params.
+                 elif model_param.type() == 'torch.cuda.FloatTensor':
+@@ -423,6 +433,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                     )
+                     if hasattr(model_param, 'shared'):
+                         shard_model_param.shared = model_param.shared
++                    init_sparse_manager(model_param=model_param, shard_model_weight=shard_model_param, shard_main_weight=shard_model_param, param_range=param_range)
+ 
+                 else:
+                     raise TypeError(
+@@ -2456,7 +2467,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                         # FP8 params are quantized in the above "quantize_param_shard" function.
+                         continue
+                     else:
+-                        shard_model_param.data.copy_(shard_main_param)
++                        with sparse_diff_context(shard_model_param, shard_main_param):
++                            shard_model_param.data.copy_(shard_main_param)
+ 
+         # Copy shard groups to model groups.
+         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/core/pipeline_parallel/p2p_communication.py
+index f18309217..ac839c21f 100644
+--- a/megatron/core/pipeline_parallel/p2p_communication.py
++++ b/megatron/core/pipeline_parallel/p2p_communication.py
+@@ -26,22 +26,22 @@ def _batched_p2p_ops(
+     ops = []
+     if tensor_send_prev is not None:
+         send_prev_op = torch.distributed.P2POp(
+-            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank,
++            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
+         )
+         ops.append(send_prev_op)
+     if tensor_recv_prev is not None:
+         recv_prev_op = torch.distributed.P2POp(
+-            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank,
++            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
+         )
+         ops.append(recv_prev_op)
+     if tensor_send_next is not None:
+         send_next_op = torch.distributed.P2POp(
+-            torch.distributed.isend, tensor_send_next, next_pipeline_rank,
++            torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
+         )
+         ops.append(send_next_op)
+     if tensor_recv_next is not None:
+         recv_next_op = torch.distributed.P2POp(
+-            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank,
++            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
+         )
+         ops.append(recv_next_op)
+     if len(ops) > 0:
