@@ -1,10 +1,10 @@
 # Helix
 high-performance, large-scale post-training framework including SFT and RL.
 
-Codes will be released soon.
+More features will be released.
 
 ## Features
-- 🔥 **SparseRL-sync**: reduce parameter sync size by **30x ~ 100x with 100% accuracy**, valided on models 8B ~ 671B, GRPO, DAPO, GSPO etc, generic reasoning and agentic. Check our [tech report](https://github.com/scitix/helix/blob/main/paper/sparseRL-sync.pdf)
+- 🔥 **SparseRL-sync**: reduce parameter sync size by **30x ~ 100x with 100% accuracy**, valided on models 8B ~ 671B, GRPO, DAPO, GSPO etc, generic and agentic reasoning. Check our [tech report](https://github.com/scitix/helix/blob/main/paper/sparseRL-sync.pdf) or [arxiv] (https://arxiv.org/abs/2605.07330). PoC code based on Slime.
 
 <p align="center">
   <img src="assets/model_payload_size.png" alt="Per-synchronization payload across model scales" width="49%" />
